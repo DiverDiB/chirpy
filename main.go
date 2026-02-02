@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/diverdib/chirpy/internal/auth"
 	"github.com/diverdib/chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -28,6 +29,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	tokenSecret    string
 }
 
 type Chirp struct {
@@ -80,23 +82,27 @@ func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) handlerUsersCreate(w http.ResponseWriter, r *http.Request) {
-	type parameters struct {
-		Email string `json:"email`
-	}
-
-	decoder := json.NewDecoder(r.Body)
 	params := parameters{}
+	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&params)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters")
 		return
 	}
 
+	// Hash the password
+	hashedPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't has password")
+	}
+
+	// Create the user in the dB
 	user, err := cfg.db.CreateUser(r.Context(), database.CreateUserParams{
-		ID:        uuid.New(),
-		CreatedAt: time.Now().UTC(),
-		UpdatedAt: time.Now().UTC(),
-		Email:     params.Email,
+		ID:             uuid.New(),
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+		Email:          params.Email,
+		HashedPassword: hashedPassword,
 	})
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't create user")
@@ -108,6 +114,60 @@ func (cfg *apiConfig) handlerUsersCreate(w http.ResponseWriter, r *http.Request)
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
 		Email:     user.Email,
+	})
+}
+
+func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
+	type response struct {
+		User
+		Token string `json:"token"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters")
+		return
+	}
+
+	// Look up the user by email
+	user, err := cfg.db.GetUserByEmail(r.Context(), params.Email)
+	if err != nil {
+		// Return 401 if user doesn't exist
+		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
+		return
+	}
+
+	// Compare the provided password with the stored hash
+	match, err := auth.CheckPasswordHash(params.Password, user.HashedPassword)
+	if err != nil || !match {
+		// This handles actual system errors
+		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
+	}
+
+	// Define how long the token should be valid
+	expirationTime := time.Hour
+
+	// Generate the JWT using your Make JWT function
+	token, err := auth.MakeJWT(
+		user.ID,
+		cfg.tokenSecret,
+		expirationTime,
+	)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create JWT")
+		return
+	}
+	// Return the user and the token on success (200 OK)
+	respondWithJSON(w, http.StatusOK, response{
+		User: User{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		},
+		Token: token,
 	})
 }
 
@@ -210,9 +270,10 @@ func (cfg *apiConfig) handlerChirpGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-//type parameters struct {
-//	Body string `json:"body"`
-//}
+type parameters struct {
+	Password string `json:"password"`
+	Email    string `json:"email"`
+}
 
 type errorResponse struct {
 	Error string `json:"error"`
@@ -287,6 +348,10 @@ func main() {
 	if dbURL == "" {
 		log.Fatal("DB_URL must be set")
 	}
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		log.Fatal("JWT_SECRET must be set")
+	}
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
@@ -318,6 +383,9 @@ func main() {
 
 	// Handler to add user
 	mux.HandleFunc("POST /api/users", apiCfg.handlerUsersCreate)
+
+	// Hadnler to log in user
+	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 
 	// Handler to create chirp
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerChirpsCreate)
