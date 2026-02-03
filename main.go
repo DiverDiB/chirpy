@@ -29,7 +29,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
-	tokenSecret    string
+	jwtSecret      string
 }
 
 type Chirp struct {
@@ -93,7 +93,7 @@ func (cfg *apiConfig) handlerUsersCreate(w http.ResponseWriter, r *http.Request)
 	// Hash the password
 	hashedPassword, err := auth.HashPassword(params.Password)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't has password")
+		respondWithError(w, http.StatusInternalServerError, "Couldn't hash password")
 	}
 
 	// Create the user in the dB
@@ -120,7 +120,8 @@ func (cfg *apiConfig) handlerUsersCreate(w http.ResponseWriter, r *http.Request)
 func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	type response struct {
 		User
-		Token string `json:"token"`
+		Token        string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -146,17 +147,34 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
 	}
 
-	// Define how long the token should be valid
-	expirationTime := time.Hour
+	expirationDuration := time.Hour
 
 	// Generate the JWT using your Make JWT function
 	token, err := auth.MakeJWT(
 		user.ID,
-		cfg.tokenSecret,
-		expirationTime,
+		cfg.jwtSecret,
+		expirationDuration,
 	)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't create JWT")
+		return
+	}
+
+	// Generate refresh token
+	refreshToken, err := auth.MakeRefreshToken()
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create refresh token")
+		return
+	}
+	_, err = cfg.db.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+		Token:     refreshToken,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+		UserID:    user.ID,
+		ExpiresAt: time.Now().UTC().AddDate(0, 0, 60), // 60 days
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't save refresh token")
 		return
 	}
 	// Return the user and the token on success (200 OK)
@@ -167,19 +185,79 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 			UpdatedAt: user.UpdatedAt,
 			Email:     user.Email,
 		},
-		Token: token,
+		Token:        token,
+		RefreshToken: refreshToken,
 	})
+}
+
+func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't find token")
+		return
+	}
+
+	user, err := cfg.db.GetUserFromRefreshToken(r.Context(), refreshToken)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Token is invalid or expired")
+		return
+	}
+
+	// Issue a new access token (JWT)
+	newToken, err := auth.MakeJWT(user.ID, cfg.jwtSecret, time.Hour)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create JWT")
+		return
+	}
+	respondWithJSON(w, http.StatusOK, map[string]string{
+		"token": newToken,
+	})
+}
+
+func (cfg *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
+	// Extract the refresh token from the header
+	refreshToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Couldn't find token")
+		return
+	}
+
+	// Revoke the token in the database
+	err = cfg.db.RevokeRefreshToken(r.Context(), database.RevokeRefreshTokenParams{
+		Token:     refreshToken,
+		RevokedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't revoke token")
+		return
+	}
+
+	// Respond with 204 No Content
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (cfg *apiConfig) handlerChirpsCreate(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Body   string    `json:"body"`
-		UserID uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
+	}
+
+	// Get the token from the Authorization header
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't find JWT")
+		return
+	}
+
+	// Validate the JWT and extract the UserID
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't validate JWT")
+		return
 	}
 
 	decoder := json.NewDecoder(r.Body)
 	params := parameters{}
-	err := decoder.Decode(&params)
+	err = decoder.Decode(&params)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters")
 		return
@@ -201,7 +279,7 @@ func (cfg *apiConfig) handlerChirpsCreate(w http.ResponseWriter, r *http.Request
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
 		Body:      cleanedBody,
-		UserID:    params.UserID,
+		UserID:    userID,
 	})
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't create chirp")
@@ -271,8 +349,9 @@ func (cfg *apiConfig) handlerChirpGet(w http.ResponseWriter, r *http.Request) {
 }
 
 type parameters struct {
-	Password string `json:"password"`
-	Email    string `json:"email"`
+	Password         string `json:"password"`
+	Email            string `json:"email"`
+	ExpiresInSeconds *int   `json:"expires_in_seconds"`
 }
 
 type errorResponse struct {
@@ -360,8 +439,9 @@ func main() {
 
 	// Initialize the config struct
 	apiCfg := &apiConfig{
-		db:       database.New(db),
-		platform: platform,
+		db:        database.New(db),
+		platform:  platform,
+		jwtSecret: jwtSecret,
 	}
 	apiCfg.fileserverHits.Store(0)
 
@@ -384,8 +464,14 @@ func main() {
 	// Handler to add user
 	mux.HandleFunc("POST /api/users", apiCfg.handlerUsersCreate)
 
-	// Hadnler to log in user
+	// Handler to log in user
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
+
+	// Handler to get refresh token
+	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
+
+	// Handler to revoke token
+	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
 
 	// Handler to create chirp
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerChirpsCreate)
