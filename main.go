@@ -117,6 +117,57 @@ func (cfg *apiConfig) handlerUsersCreate(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+func (cfg *apiConfig) handlerUpdate(w http.ResponseWriter, r *http.Request) {
+	// Extract the token
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't find token")
+		return
+	}
+
+	// Validate the JWT and extract the UserID
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't validate JWT")
+		return
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err = decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters")
+		return
+	}
+
+	// Hash the password
+	hashedPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't hash password")
+	}
+
+	// Update the user in the dB
+	user, err := cfg.db.UpdateUser(r.Context(), database.UpdateUserParams{
+		ID:             userID,
+		UpdatedAt:      time.Now().UTC(),
+		Email:          params.Email,
+		HashedPassword: hashedPassword,
+	})
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't update user")
+		return
+	}
+
+	// Respond with the updated user
+	respondWithJSON(w, http.StatusOK, User{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+	})
+}
+
 func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	type response struct {
 		User
@@ -145,6 +196,7 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil || !match {
 		// This handles actual system errors
 		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
+		return
 	}
 
 	expirationDuration := time.Hour
@@ -348,6 +400,51 @@ func (cfg *apiConfig) handlerChirpGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (cfg *apiConfig) handlerChirpDelete(w http.ResponseWriter, r *http.Request) {
+	// Get the token from the Authorization header
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't find JWT")
+		return
+	}
+
+	// Validate the JWT and extract the UserID
+	UserID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't validate JWT")
+		return
+	}
+	chirpIDString := r.PathValue("chirpID")
+
+	// Parse the string into a UUID
+	chirpID, err := uuid.Parse(chirpIDString)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID")
+	}
+
+	// Fetch the chirp first to check owner
+	dbChirp, err := cfg.db.GetChirp(r.Context(), chirpID)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "Chirp not found")
+		return
+	}
+	// Authorization: Does the user own this chirp?
+	if dbChirp.UserID != UserID {
+		respondWithError(w, http.StatusForbidden, "You can't delete someone else's chirp")
+		return
+	}
+
+	// Query the database
+	err = cfg.db.DeleteChirp(r.Context(), chirpID)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't retrieve chirp")
+		return
+	}
+
+	// Respond with 204 No content
+	w.WriteHeader((http.StatusNoContent))
+}
+
 type parameters struct {
 	Password         string `json:"password"`
 	Email            string `json:"email"`
@@ -371,6 +468,8 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	// use "-" to ensure this field is not sent in JSON response
+	PasswordHash string `json:"-"`
 }
 
 func getCleanedBody(body string) string {
@@ -464,6 +563,8 @@ func main() {
 	// Handler to add user
 	mux.HandleFunc("POST /api/users", apiCfg.handlerUsersCreate)
 
+	mux.HandleFunc("PUT /api/users", apiCfg.handlerUpdate)
+
 	// Handler to log in user
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 
@@ -481,6 +582,9 @@ func main() {
 
 	// Handler to get chirp by ID
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerChirpGet)
+
+	// Handler to delete chirp by ID
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.handlerChirpDelete)
 
 	// Wrap the mux in the middlware
 	wrappedMux := middlewareLog(mux)
