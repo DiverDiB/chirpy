@@ -30,6 +30,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	jwtSecret      string
+	polkakey       string
 }
 
 type Chirp struct {
@@ -109,12 +110,7 @@ func (cfg *apiConfig) handlerUsersCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	respondWithJSON(w, http.StatusCreated, User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
-	})
+	respondWithJSON(w, http.StatusCreated, databaseUserToUser(user))
 }
 
 func (cfg *apiConfig) handlerUpdate(w http.ResponseWriter, r *http.Request) {
@@ -160,12 +156,7 @@ func (cfg *apiConfig) handlerUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Respond with the updated user
-	respondWithJSON(w, http.StatusOK, User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
-	})
+	respondWithJSON(w, http.StatusOK, databaseUserToUser(user))
 }
 
 func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
@@ -231,15 +222,52 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	// Return the user and the token on success (200 OK)
 	respondWithJSON(w, http.StatusOK, response{
-		User: User{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
-		},
+		User:         databaseUserToUser(user),
 		Token:        token,
 		RefreshToken: refreshToken,
 	})
+}
+
+func (cfg *apiConfig) handlerPolkaWebhooks(w http.ResponseWriter, r *http.Request) {
+	// Extract the api key
+	GetAPIKey, err := auth.GetAPIKey(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't find api key")
+		return
+	}
+
+	if GetAPIKey != cfg.polkakey {
+		respondWithError(w, http.StatusUnauthorized, "api key is invalid")
+		return
+	}
+	decoder := json.NewDecoder(r.Body)
+	req := PolkaWebhookRequest{}
+	err = decoder.Decode(&req)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Couldn't decode parameters")
+		return
+	}
+
+	// If event is not "user.upgraded", responsd with 204 immediately
+	if req.Event != "user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Attempt to upgrade the user
+	err = cfg.db.UpgradeUser(r.Context(), req.Data.UserID)
+	if err != nil {
+		// If the user isn't found, respond with 404
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusNotFound, "User not found")
+			return
+		}
+		respondWithError(w, http.StatusInternalServerError, "Couldn't upgrade user")
+		return
+	}
+	// Respond with 204 on success
+	w.WriteHeader((http.StatusNoContent))
+
 }
 
 func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
@@ -348,7 +376,21 @@ func (cfg *apiConfig) handlerChirpsCreate(w http.ResponseWriter, r *http.Request
 }
 
 func (cfg *apiConfig) handlerChirpsGet(w http.ResponseWriter, r *http.Request) {
-	dbChirps, err := cfg.db.GetChirps(r.Context())
+	authorIDString := r.URL.Query().Get("author_id")
+
+	var dbChirps []database.Chirp
+	var err error
+
+	if authorIDString != "" {
+		authorID, parseErr := uuid.Parse(authorIDString)
+		if parseErr != nil {
+			respondWithError(w, http.StatusBadRequest, "Invalid author ID")
+			return
+		}
+		dbChirps, err = cfg.db.GetChirpsForAuthor(r.Context(), authorID)
+	} else {
+		dbChirps, err = cfg.db.GetChirps(r.Context())
+	}
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't retrieve chirps")
 		return
@@ -470,6 +512,14 @@ type User struct {
 	Email     string    `json:"email"`
 	// use "-" to ensure this field is not sent in JSON response
 	PasswordHash string `json:"-"`
+	IsChirpyRed  bool   `json:"is_chirpy_red"`
+}
+
+type PolkaWebhookRequest struct {
+	Event string `json:"event"`
+	Data  struct {
+		UserID uuid.UUID `json:"user_id"`
+	} `json:"data"`
 }
 
 func getCleanedBody(body string) string {
@@ -515,6 +565,16 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(dat)
 }
 
+func databaseUserToUser(user database.User) User {
+	return User{
+		ID:          user.ID,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Email:       user.Email,
+		IsChirpyRed: user.IsChirpyRed,
+	}
+}
+
 func main() {
 	// Load the environment file
 	err := godotenv.Load()
@@ -530,6 +590,10 @@ func main() {
 	if jwtSecret == "" {
 		log.Fatal("JWT_SECRET must be set")
 	}
+	polkakey := os.Getenv("POLKA_KEY")
+	if polkakey == "" {
+		log.Fatal("POLKA_KEY must be set")
+	}
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
@@ -541,6 +605,7 @@ func main() {
 		db:        database.New(db),
 		platform:  platform,
 		jwtSecret: jwtSecret,
+		polkakey:  polkakey,
 	}
 	apiCfg.fileserverHits.Store(0)
 
@@ -567,6 +632,9 @@ func main() {
 
 	// Handler to log in user
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
+
+	// Handler to upgrade user
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.handlerPolkaWebhooks)
 
 	// Handler to get refresh token
 	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
