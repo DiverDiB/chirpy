@@ -377,6 +377,11 @@ func (cfg *apiConfig) handlerChirpsCreate(w http.ResponseWriter, r *http.Request
 
 func (cfg *apiConfig) handlerChirpsGet(w http.ResponseWriter, r *http.Request) {
 	authorIDString := r.URL.Query().Get("author_id")
+	sortIDString := r.URL.Query().Get("sort")
+	if sortIDString != "" && sortIDString != "asc" && sortIDString != "desc" {
+		respondWithError(w, http.StatusBadRequest, "Invalid sort parameter")
+		return
+	}
 
 	var dbChirps []database.Chirp
 	var err error
@@ -387,9 +392,17 @@ func (cfg *apiConfig) handlerChirpsGet(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusBadRequest, "Invalid author ID")
 			return
 		}
-		dbChirps, err = cfg.db.GetChirpsForAuthor(r.Context(), authorID)
+		if sortIDString == "desc" {
+			dbChirps, err = cfg.db.GetChirpsForAuthorDesc(r.Context(), authorID)
+		} else {
+			dbChirps, err = cfg.db.GetChirpsForAuthor(r.Context(), authorID)
+		}
 	} else {
-		dbChirps, err = cfg.db.GetChirps(r.Context())
+		if sortIDString == "desc" {
+			dbChirps, err = cfg.db.GetChirpsDesc(r.Context())
+		} else {
+			dbChirps, err = cfg.db.GetChirps(r.Context())
+		}
 	}
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't retrieve chirps")
